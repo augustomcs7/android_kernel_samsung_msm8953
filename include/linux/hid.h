@@ -883,7 +883,6 @@ static inline void hid_map_usage(struct hid_input *hidinput,
 		__u8 type, __u16 c)
 {
 	struct input_dev *input = hidinput->input;
-
 	usage->type = type;
 	usage->code = c;
 
