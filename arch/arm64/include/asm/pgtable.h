@@ -19,6 +19,7 @@
 #include <asm/bug.h>
 #include <asm/proc-fns.h>
 
+#include <asm/bug.h>
 #include <asm/memory.h>
 #include <asm/pgtable-hwdef.h>
 #include <asm/pgtable-prot.h>
@@ -85,8 +86,6 @@ extern unsigned long empty_zero_page[PAGE_SIZE / sizeof(unsigned long)];
 #define pte_valid(pte)		(!!(pte_val(pte) & PTE_VALID))
 #define pte_valid_not_user(pte) \
 	((pte_val(pte) & (PTE_VALID | PTE_USER)) == PTE_VALID)
-#define pte_valid_young(pte) \
-	((pte_val(pte) & (PTE_VALID | PTE_AF)) == (PTE_VALID | PTE_AF))
 #define pte_valid_user(pte) \
 	((pte_val(pte) & (PTE_VALID | PTE_USER)) == (PTE_VALID | PTE_USER))
 
@@ -94,9 +93,12 @@ extern unsigned long empty_zero_page[PAGE_SIZE / sizeof(unsigned long)];
  * Could the pte be present in the TLB? We must check mm_tlb_flush_pending
  * so that we don't erroneously return false for pages that have been
  * remapped as PROT_NONE but are yet to be flushed from the TLB.
+ * Note that we can't make any assumptions based on the state of the access
+ * flag, since ptep_clear_flush_young() elides a DSB when invalidating the
+ * TLB.
  */
 #define pte_accessible(mm, pte)	\
-	(mm_tlb_flush_pending(mm) ? pte_present(pte) : pte_valid_young(pte))
+	(mm_tlb_flush_pending(mm) ? pte_present(pte) : pte_valid(pte))
 
 /*
  * p??_access_permitted() is true for valid user mappings (subject to the
@@ -185,6 +187,34 @@ static inline pmd_t pmd_mkcont(pmd_t pmd)
 
 static inline void set_pte(pte_t *ptep, pte_t pte)
 {
+#ifdef CONFIG_ARM64_STRICT_BREAK_BEFORE_MAKE
+	pteval_t old = pte_val(*ptep);
+	pteval_t new = pte_val(pte);
+
+	/* Only problematic if valid -> valid */
+	if (!(old & new & PTE_VALID))
+		goto pte_ok;
+
+	/* Changing attributes should go via an invalid entry */
+	if (WARN_ON((old & PTE_ATTRINDX_MASK) != (new & PTE_ATTRINDX_MASK)))
+		goto pte_bad;
+
+	/* Change of OA is only an issue if one mapping is writable */
+	if (!(old & new & PTE_RDONLY) &&
+	    WARN_ON(pte_pfn(*ptep) != pte_pfn(pte)))
+		goto pte_bad;
+
+	goto pte_ok;
+
+pte_bad:
+	*ptep = __pte(0);
+	dsb(ishst);
+	asm("tlbi	vmalle1is");
+	dsb(ish);
+	isb();
+pte_ok:
+#endif
+
 	*ptep = pte;
 
 	/*
